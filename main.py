@@ -128,7 +128,11 @@ def parse_genai_json_response(response):
 
 
 @app.post("/gold-assistant")
-async def gold_assistant(query: Optional[str] = Form(None), audio: Optional[UploadFile] = File(None)):
+async def gold_assistant(
+    query: Optional[str] = Form(None),
+    audio: Optional[UploadFile] = File(None),
+    session_id: Optional[str] = Form(None)
+):
     if audio:
         query = await transcribe_audio(audio)
 
@@ -148,17 +152,24 @@ async def gold_assistant(query: Optional[str] = Form(None), audio: Optional[Uplo
 
     parsed = parse_genai_json_response(response)
     reply_text = parsed.get("answer", "")
+    intent = parsed.get("intent", "info")
 
-    if parsed.get("intent") == "buy_gold":
+    # 🎯 If intent is buy_gold, create/initiate session
+    if intent == "buy_gold":
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            sessions[session_id] = {"stage": "name", "data": {}}
         reply_text = "It looks like you want to buy gold. Please continue via /buy-gold API."
 
     audio_file = await synthesize_audio(reply_text)
 
     return {
+        "session_id": session_id,   # always return session id if exists
         "reply": reply_text,
-        "intent": parsed.get("intent", "info"),
+        "intent": intent,
         "audio_file": audio_file
     }
+
 
 
 @app.post("/buy-gold")
