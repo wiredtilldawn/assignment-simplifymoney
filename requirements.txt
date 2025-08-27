@@ -5,4 +5,8 @@ python-dotenv
 SQLAlchemy>=1.4
 python-multipart
 aiohttp
+psycopg2-binary
 pydantic
+deepgram-sdk
+requests
+typing-extensions
