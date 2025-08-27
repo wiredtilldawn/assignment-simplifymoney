@@ -131,7 +131,6 @@ def parse_genai_json_response(response):
 async def gold_assistant(
     query: Optional[str] = Form(None),
     audio: Optional[UploadFile] = File(None),
-    session_id: Optional[str] = Form(None)
 ):
     if audio:
         query = await transcribe_audio(audio)
@@ -154,106 +153,103 @@ async def gold_assistant(
     reply_text = parsed.get("answer", "")
     intent = parsed.get("intent", "info")
 
-    # 🎯 If intent is buy_gold, create/initiate session
+    session_id = None
     if intent == "buy_gold":
-        if not session_id:
-            session_id = str(uuid.uuid4())
-            sessions[session_id] = {"stage": "name", "data": {}}
+        session_id = str(uuid.uuid4())
+        sessions[session_id] = {"stage": "name", "data": {}}
         reply_text = "It looks like you want to buy gold. Please continue via /buy-gold API."
 
     audio_file = await synthesize_audio(reply_text)
 
     return {
-        "session_id": session_id,   # always return session id if exists
         "reply": reply_text,
         "intent": intent,
+        "session_id": session_id,
         "audio_file": audio_file
     }
 
 
-
 @app.post("/buy-gold")
-async def buy_gold(session_id: Optional[str] = Form(None), query: Optional[str] = Form(None), audio: Optional[UploadFile] = File(None)):
+async def buy_gold(
+    session_id: str = Form(...),
+    query: Optional[str] = Form(None),
+    audio: Optional[UploadFile] = File(None),
+):
+    if session_id not in sessions:
+        return {"error": "Invalid or expired session. Please restart via /gold-assistant."}
+
     if audio:
         query = await transcribe_audio(audio)
 
     if not query:
         return {"error": "No query provided"}
 
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        sessions[session_id] = {"stage": "name", "data": {}}
-        reply = "Great! Let's get started. What's your full name?"
-        audio_file = await synthesize_audio(reply)
-        return {"session_id": session_id, "reply": reply, "audio_file": audio_file}
+    session = sessions[session_id]
+    stage = session["stage"]
 
-    if session_id in sessions:
-        session = sessions[session_id]
-        stage = session["stage"]
+    # 🚦 Stage flow
+    if stage == "name":
+        session["data"]["name"] = query
+        session["stage"] = "email"
+        reply = "Thanks! Please provide your email."
 
-        if stage == "name":
-            session["data"]["name"] = query
-            session["stage"] = "email"
-            reply = "Thanks! Please provide your email."
+    elif stage == "email":
+        session["data"]["email"] = query
+        session["stage"] = "phone"
+        reply = "Got it. What's your phone number?"
 
-        elif stage == "email":
-            session["data"]["email"] = query
-            session["stage"] = "phone"
-            reply = "Got it. What's your phone number?"
+    elif stage == "phone":
+        session["data"]["phone"] = query
+        session["stage"] = "grams"
+        reply = "Perfect. How many grams of gold would you like to buy?"
 
-        elif stage == "phone":
-            session["data"]["phone"] = query
-            session["stage"] = "grams"
-            reply = "Perfect. How many grams of gold would you like to buy?"
+    elif stage == "grams":
+        try:
+            grams = float(query)
+        except ValueError:
+            reply = "Please enter a valid number for grams."
+            audio_file = await synthesize_audio(reply)
+            return {"session_id": session_id, "reply": reply, "audio_file": audio_file}
 
-        elif stage == "grams":
-            try:
-                grams = float(query)
-            except ValueError:
-                reply = "Please enter a valid number for grams."
-                audio_file = await synthesize_audio(reply)
-                return {"session_id": session_id, "reply": reply, "audio_file": audio_file}
+        session["data"]["grams"] = grams
+        db = SessionLocal()
+        try:
+            latest_price = db.query(GoldPrice).order_by(GoldPrice.id.desc()).first()
+            price_per_gram = latest_price.price_per_gram if latest_price else 6000.0
+        finally:
+            db.close()
 
-            session["data"]["grams"] = grams
+        total_amount = grams * price_per_gram
+        session["data"]["price_per_gram"] = price_per_gram
+        session["data"]["total_amount"] = total_amount
+        session["stage"] = "confirm"
+
+        reply = f"Gold price is ₹{price_per_gram}/gram. For {grams} grams, total = ₹{total_amount}. Do you want to confirm purchase? (yes/no)"
+
+    elif stage == "confirm":
+        if query.lower() == "yes":
+            data = session["data"]
             db = SessionLocal()
             try:
-                latest_price = db.query(GoldPrice).order_by(GoldPrice.id.desc()).first()
-                price_per_gram = latest_price.price_per_gram if latest_price else 6000.0
+                user = User(name=data["name"], email=data["email"], phone=data["phone"])
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+
+                order = Order(user_id=user.id, grams=data["grams"], total_amount=data["total_amount"])
+                db.add(order)
+                db.commit()
             finally:
                 db.close()
 
-            total_amount = grams * price_per_gram
-            session["data"]["price_per_gram"] = price_per_gram
-            session["data"]["total_amount"] = total_amount
-            session["stage"] = "confirm"
-
-            reply = f"Gold price is ₹{price_per_gram}/gram. For {grams} grams, total = ₹{total_amount}. Do you want to confirm purchase? (yes/no)"
-
-        elif stage == "confirm":
-            if query.lower() == "yes":
-                data = session["data"]
-                db = SessionLocal()
-                try:
-                    user = User(name=data["name"], email=data["email"], phone=data["phone"])
-                    db.add(user)
-                    db.commit()
-                    db.refresh(user)
-
-                    order = Order(user_id=user.id, grams=data["grams"], total_amount=data["total_amount"])
-                    db.add(order)
-                    db.commit()
-                finally:
-                    db.close()
-
-                sessions.pop(session_id, None)
-                reply = "✅ Order confirmed and placed successfully!"
-            else:
-                sessions.pop(session_id, None)
-                reply = "❌ Order cancelled."
+            sessions.pop(session_id, None)
+            reply = "✅ Order confirmed and placed successfully!"
         else:
-            reply = "Invalid stage. Restart process."
+            sessions.pop(session_id, None)
+            reply = "❌ Order cancelled."
 
-        audio_file = await synthesize_audio(reply)
-        return {"session_id": session_id, "reply": reply, "audio_file": audio_file}
+    else:
+        reply = "Invalid stage. Restart process."
 
-    return {"reply": "Invalid session. Please restart from /buy-gold."}
+    audio_file = await synthesize_audio(reply)
+    return {"session_id": session_id, "reply": reply, "audio_file": audio_file}
